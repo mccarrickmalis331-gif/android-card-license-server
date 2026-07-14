@@ -9,13 +9,24 @@ const ROOT = __dirname;
 const TOOLS = path.join(ROOT, "tools");
 const WORK = path.join(ROOT, "work");
 const OUT = path.join(ROOT, "out");
+const DATA = path.join(ROOT, "data");
+const CARDS_FILE = path.join(DATA, "cards.json");
 const PORT = Number(process.env.PORT || 8789);
 const DEFAULT_SERVER = process.env.DEFAULT_LICENSE_SERVER || "https://android-license-gateway-phone.pages.dev";
 const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/+$/, "");
 const APKTOOL_VERSION = "3.0.2";
 const APKTOOL_URL = `https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar`;
+const LICENSE_DEFAULTS = {
+  ADMIN_TOKEN: process.env.ADMIN_TOKEN || "change_this_admin_token",
+  APP_ID: process.env.APP_ID || "demo_android_app",
+  APP_SECRET: process.env.APP_SECRET || "change_this_app_secret",
+  RC4_KEY: process.env.RC4_KEY || "change_this_rc4_key",
+  TIMESTAMP_WINDOW_SECONDS: Number(process.env.TIMESTAMP_WINDOW_SECONDS || 300),
+  HEARTBEAT_GRACE_SECONDS: Number(process.env.HEARTBEAT_GRACE_SECONDS || 180)
+};
 
-for (const dir of [TOOLS, WORK, OUT]) fs.mkdirSync(dir, { recursive: true });
+for (const dir of [TOOLS, WORK, OUT, DATA]) fs.mkdirSync(dir, { recursive: true });
+if (!fs.existsSync(CARDS_FILE)) fs.writeFileSync(CARDS_FILE, "[]", "utf8");
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -29,6 +40,12 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname.startsWith("/out/")) return file(res, path.join(OUT, decodeURIComponent(url.pathname.slice(5))));
     if (req.method === "GET" && url.pathname === "/api/status") return json(res, { ok: true, tools: await detectTools(), accessUrls: accessUrls() });
     if (req.method === "POST" && url.pathname === "/api/process") return await processUpload(req, res, url);
+    if (req.method === "GET" && url.pathname === "/admin/cards") return adminJson(req, res, () => ({ ok: true, cards: listCards() }));
+    if (req.method === "POST" && url.pathname === "/admin/cards") return adminJson(req, res, async () => createCards(await readJsonBody(req)));
+    if (req.method === "DELETE" && url.pathname === "/admin/cards") return adminJson(req, res, () => deleteAllCards());
+    if (url.pathname.startsWith("/admin/cards/")) return adminJson(req, res, async () => updateCard(url.pathname.slice("/admin/cards/".length), req.method, await readJsonBody(req).catch(() => ({}))));
+    if (req.method === "POST" && url.pathname === "/api/activate") return licenseApi(req, res, activateCard);
+    if (req.method === "POST" && url.pathname === "/api/heartbeat") return licenseApi(req, res, heartbeatCard);
     return json(res, { ok: false, message: "not found" }, 404);
   } catch (error) {
     return json(res, { ok: false, message: error.message || String(error) }, 500);
@@ -78,7 +95,11 @@ async function processUpload(req, res, url) {
   manifest = addLicenseActivity(manifest);
   fs.writeFileSync(manifestPath, manifest, "utf8");
 
-  writeJavaSources(javaDir, packageName, launcher, serverUrl, appId, appSecret, rc4Key, cardName, purchaseUrl, jumpText, jumpUrl);
+  const unsignedApk = path.join(jobDir, "unsigned.apk");
+  await run(tools.java, ["-jar", apktool, "b", decodedDir, "-o", unsignedApk], jobDir);
+  const dexHashes = useVmp ? await originalDexHashes(unsignedApk, jobDir) : [];
+
+  writeJavaSources(javaDir, packageName, launcher, serverUrl, appId, appSecret, rc4Key, cardName, purchaseUrl, jumpText, jumpUrl, useVmp, dexHashes);
   fs.mkdirSync(classesDir, { recursive: true });
   const javaFiles = listFiles(javaDir).filter((f) => f.endsWith(".java"));
   await run(tools.javac, ["-encoding", "UTF-8", "-source", "8", "-target", "8", "-bootclasspath", tools.androidJar, "-d", classesDir, ...javaFiles], jobDir);
@@ -100,8 +121,6 @@ async function processUpload(req, res, url) {
     if (obfuscate) obfuscationMessage = "未找到 R8，验证框已注入但未混淆";
   }
 
-  const unsignedApk = path.join(jobDir, "unsigned.apk");
-  await run(tools.java, ["-jar", apktool, "b", decodedDir, "-o", unsignedApk], jobDir);
   const withDexApk = path.join(jobDir, "with-license.apk");
   fs.copyFileSync(unsignedApk, withDexApk);
   await addDex(withDexApk, path.join(dexDir, "classes.dex"));
@@ -109,7 +128,7 @@ async function processUpload(req, res, url) {
   const alignedApk = path.join(jobDir, "aligned.apk");
   await run(tools.zipalign, ["-f", "-p", "4", withDexApk, alignedApk], jobDir);
   const keystore = await ensureKeystore(tools);
-  const signedName = originalName.replace(/\.apk$/i, "") + "-license.apk";
+  const signedName = originalName.replace(/\.apk$/i, "") + (useVmp ? "-license-vmp-plus.apk" : "-license.apk");
   const signedApk = path.join(OUT, signedName);
   await run(tools.apksigner, [
     "sign",
@@ -121,18 +140,10 @@ async function processUpload(req, res, url) {
     alignedApk
   ], jobDir);
 
-  let finalName = signedName;
-  let vmpMessage = "未启用 VMP 壳";
-  if (useVmp) {
-    const vmp = findVmpPacker();
-    if (vmp) {
-      finalName = originalName.replace(/\.apk$/i, "") + "-license-vmp.apk";
-      await run(vmp, [signedApk, path.join(OUT, finalName)], jobDir);
-      vmpMessage = "已调用 VMP 壳";
-    } else {
-      vmpMessage = "未找到 VMP 工具，已输出注入验证框并签名的 APK";
-    }
-  }
+  const finalName = signedName;
+  const vmpMessage = useVmp
+    ? `已启用内置 VMP+：配置字符串加密、验证结果虚拟机、反调试、${dexHashes.length} 个原始 DEX 完整性校验`
+    : "未启用 VMP+ 保护";
 
   return json(res, {
     ok: true,
@@ -148,6 +159,237 @@ async function processUpload(req, res, url) {
     obfuscationMessage,
     vmpMessage
   });
+}
+
+function loadCards() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(CARDS_FILE, "utf8"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function saveCards(cards) {
+  fs.writeFileSync(CARDS_FILE, JSON.stringify(cards, null, 2), "utf8");
+}
+
+function publicCard(card) {
+  const now = nowSeconds();
+  return {
+    cardKey: card.cardKey,
+    cardName: normalizeCardName(card.cardName),
+    status: card.status,
+    durationSeconds: card.durationSeconds,
+    deviceId: card.deviceId || null,
+    createdAt: card.createdAt,
+    activatedAt: card.activatedAt || null,
+    expiresAt: card.expiresAt || null,
+    remainingSeconds: card.expiresAt ? Math.max(0, card.expiresAt - now) : null,
+    lastHeartbeatAt: card.lastHeartbeatAt || null,
+    appVersion: card.appVersion || "",
+    note: card.note || ""
+  };
+}
+
+function listCards() {
+  return loadCards()
+    .map((card) => {
+      if (card.status === "active" && card.expiresAt && card.expiresAt <= nowSeconds()) card.status = "expired";
+      return publicCard(card);
+    })
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+}
+
+function createCards(body) {
+  const cards = loadCards();
+  const count = Math.max(1, Math.min(200, Math.floor(Number(body.count || 1))));
+  const durationSeconds = durationToSeconds(body);
+  const cardName = normalizeCardName(body.cardName);
+  const created = [];
+  for (let i = 0; i < count; i += 1) {
+    let cardKey = makeCardKey();
+    while (cards.some((card) => card.cardKey === cardKey)) cardKey = makeCardKey();
+    const card = {
+      cardKey,
+      cardName,
+      status: "unused",
+      durationSeconds,
+      deviceId: null,
+      createdAt: nowSeconds(),
+      activatedAt: null,
+      expiresAt: null,
+      lastHeartbeatAt: null,
+      appVersion: "",
+      note: String(body.note || "")
+    };
+    cards.push(card);
+    created.push(publicCard(card));
+  }
+  saveCards(cards);
+  return { ok: true, cards: created };
+}
+
+function updateCard(cardKeyRaw, method, body) {
+  const cardKey = decodeURIComponent(cardKeyRaw || "").trim().toUpperCase();
+  const cards = loadCards();
+  const index = cards.findIndex((card) => card.cardKey === cardKey);
+  if (index < 0) return { ok: false, message: "card not found" };
+  if (method === "DELETE") {
+    cards.splice(index, 1);
+    saveCards(cards);
+    return { ok: true };
+  }
+  if (method !== "PATCH") return { ok: false, message: "method not allowed" };
+  const card = cards[index];
+  const action = String(body.action || "");
+  if (action === "disable") card.status = "disabled";
+  if (action === "enable") card.status = card.activatedAt ? "active" : "unused";
+  if (action === "reset") {
+    card.status = "unused";
+    card.deviceId = null;
+    card.activatedAt = null;
+    card.expiresAt = null;
+    card.lastHeartbeatAt = null;
+    card.appVersion = "";
+  }
+  cards[index] = card;
+  saveCards(cards);
+  return { ok: true, card: publicCard(card) };
+}
+
+function deleteAllCards() {
+  const deleted = loadCards().length;
+  saveCards([]);
+  return { ok: true, deleted };
+}
+
+function activateCard(payload) {
+  const cardKey = String(payload.cardKey || "").trim().toUpperCase();
+  const requestCardName = normalizeCardName(payload.cardName);
+  const deviceId = String(payload.deviceId || "").trim();
+  if (!cardKey || !deviceId) return { ok: false, code: 1101, message: "cardKey and deviceId are required" };
+  const cards = loadCards();
+  const card = cards.find((item) => item.cardKey === cardKey);
+  if (!card) return { ok: false, code: 2001, message: "card not found" };
+  const actualCardName = normalizeCardName(card.cardName);
+  if (actualCardName !== requestCardName) return { ok: false, code: 2010, message: "card name mismatch" };
+  if (card.status === "disabled") return { ok: false, code: 2005, message: "card disabled" };
+  if (card.status === "expired" || (card.expiresAt && card.expiresAt <= nowSeconds())) {
+    card.status = "expired";
+    saveCards(cards);
+    return { ok: false, code: 2004, message: "card expired" };
+  }
+  if (card.status === "active" && card.deviceId !== deviceId) return { ok: false, code: 2003, message: "device mismatch" };
+  if (card.status === "unused") {
+    card.status = "active";
+    card.deviceId = deviceId;
+    card.activatedAt = nowSeconds();
+    card.expiresAt = card.activatedAt + card.durationSeconds;
+  }
+  card.lastHeartbeatAt = nowSeconds();
+  card.appVersion = String(payload.appVersion || "");
+  card.cardName = actualCardName;
+  saveCards(cards);
+  return { ok: true, code: 0, message: "activate ok", ...publicCard(card) };
+}
+
+function heartbeatCard(payload) {
+  const cardKey = String(payload.cardKey || "").trim().toUpperCase();
+  const requestCardName = normalizeCardName(payload.cardName);
+  const deviceId = String(payload.deviceId || "").trim();
+  const cards = loadCards();
+  const card = cards.find((item) => item.cardKey === cardKey);
+  if (!card) return { ok: false, code: 2001, message: "card not found" };
+  const actualCardName = normalizeCardName(card.cardName);
+  if (actualCardName !== requestCardName) return { ok: false, code: 2010, message: "card name mismatch" };
+  if (card.status !== "active") return { ok: false, code: 2002, message: `card is ${card.status}` };
+  if (card.deviceId !== deviceId) return { ok: false, code: 2003, message: "device mismatch" };
+  if (card.expiresAt <= nowSeconds()) {
+    card.status = "expired";
+    saveCards(cards);
+    return { ok: false, code: 2004, message: "card expired" };
+  }
+  card.lastHeartbeatAt = nowSeconds();
+  card.appVersion = String(payload.appVersion || "");
+  card.cardName = actualCardName;
+  saveCards(cards);
+  return { ok: true, code: 0, message: "heartbeat ok", ...publicCard(card), nextHeartbeatSeconds: LICENSE_DEFAULTS.HEARTBEAT_GRACE_SECONDS };
+}
+
+async function licenseApi(req, res, handler) {
+  try {
+    const envelope = await readJsonBody(req);
+    const payload = openEnvelope(envelope);
+    return json(res, makeEnvelope(handler(payload)));
+  } catch (error) {
+    return json(res, makeEnvelope({ ok: false, code: error.code || 1000, message: error.message || "bad request" }), 400);
+  }
+}
+
+async function adminJson(req, res, fn) {
+  if ((req.headers["x-admin-token"] || "") !== LICENSE_DEFAULTS.ADMIN_TOKEN) return json(res, { ok: false, message: "admin token invalid" }, 401);
+  try {
+    const result = await fn();
+    return json(res, result);
+  } catch (error) {
+    return json(res, { ok: false, message: error.message || String(error) }, 500);
+  }
+}
+
+function openEnvelope(envelope) {
+  const appId = String(envelope.appId || "");
+  const ts = Number(envelope.ts || 0);
+  const nonce = String(envelope.nonce || "");
+  const data = String(envelope.data || "");
+  const sign = String(envelope.sign || "").toLowerCase();
+  if (appId !== LICENSE_DEFAULTS.APP_ID) throw Object.assign(new Error("app id invalid"), { code: 1001 });
+  if (!ts || Math.abs(nowSeconds() - ts) > LICENSE_DEFAULTS.TIMESTAMP_WINDOW_SECONDS) throw Object.assign(new Error("timestamp expired"), { code: 1002 });
+  if (md5(appId + ts + nonce + data + LICENSE_DEFAULTS.APP_SECRET) !== sign) throw Object.assign(new Error("signature invalid"), { code: 1003 });
+  const payload = JSON.parse(rc4(Buffer.from(data, "hex"), LICENSE_DEFAULTS.RC4_KEY).toString("utf8"));
+  if (Number(payload.ts) !== ts) throw Object.assign(new Error("payload timestamp mismatch"), { code: 1004 });
+  return payload;
+}
+
+function makeEnvelope(payload) {
+  const ts = nowSeconds();
+  const nonce = crypto.randomBytes(16).toString("hex");
+  payload.ts = ts;
+  const data = rc4(Buffer.from(JSON.stringify(payload), "utf8"), LICENSE_DEFAULTS.RC4_KEY).toString("hex");
+  const sign = md5(LICENSE_DEFAULTS.APP_ID + ts + nonce + data + LICENSE_DEFAULTS.APP_SECRET);
+  return { appId: LICENSE_DEFAULTS.APP_ID, ts, nonce, data, sign };
+}
+
+function md5(text) {
+  return crypto.createHash("md5").update(text, "utf8").digest("hex");
+}
+
+function rc4(input, keyText) {
+  const key = Buffer.from(String(keyText), "utf8");
+  const s = Array.from({ length: 256 }, (_, i) => i);
+  let j = 0;
+  for (let i = 0; i < 256; i += 1) {
+    j = (j + s[i] + key[i % key.length]) & 255;
+    [s[i], s[j]] = [s[j], s[i]];
+  }
+  const out = Buffer.alloc(input.length);
+  let i = 0;
+  j = 0;
+  for (let n = 0; n < input.length; n += 1) {
+    i = (i + 1) & 255;
+    j = (j + s[i]) & 255;
+    [s[i], s[j]] = [s[j], s[i]];
+    out[n] = input[n] ^ s[(s[i] + s[j]) & 255];
+  }
+  return out;
+}
+
+async function readJsonBody(req) {
+  const file = path.join(os.tmpdir(), `body-${Date.now()}-${crypto.randomBytes(3).toString("hex")}.json`);
+  await saveBody(req, file);
+  const text = fs.readFileSync(file, "utf8");
+  fs.unlink(file, () => {});
+  return text ? JSON.parse(text) : {};
 }
 
 async function detectTools() {
@@ -167,7 +409,7 @@ async function detectTools() {
     apksigner: firstExisting([path.join(buildTools || "", "apksigner.bat"), path.join(buildTools || "", "apksigner")]),
     androidJar: platform ? path.join(platform, "android.jar") : "",
     apktool: fs.existsSync(path.join(TOOLS, `apktool_${APKTOOL_VERSION}.jar`)) ? path.join(TOOLS, `apktool_${APKTOOL_VERSION}.jar`) : "",
-    vmp: findVmpPacker() || ""
+    vmp: "builtin-vmp-plus"
   };
 }
 
@@ -261,10 +503,44 @@ function normalizeCardName(value) {
   return (value || "默认软件").trim().replace(/\s+/g, " ").slice(0, 48) || "默认软件";
 }
 
-function writeJavaSources(root, packageName, launcher, serverUrl, appId, appSecret, rc4Key, cardName, purchaseUrl, jumpText, jumpUrl) {
+function nowSeconds() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function makeCardKey() {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let raw = "";
+  for (let i = 0; i < 16; i += 1) raw += alphabet[crypto.randomInt(alphabet.length)];
+  return raw.replace(/(.{4})/g, "$1-").replace(/-$/, "");
+}
+
+function durationToSeconds(body) {
+  if (Number.isFinite(Number(body.durationSeconds)) && Number(body.durationSeconds) > 0) {
+    return Math.floor(Number(body.durationSeconds));
+  }
+  const amount = Math.max(1, Math.floor(Number(body.duration || 1)));
+  const unit = String(body.unit || "day");
+  const map = { minute: 60, hour: 3600, day: 86400, month: 2592000, year: 31536000 };
+  return amount * (map[unit] || map.day);
+}
+
+function writeJavaSources(root, packageName, launcher, serverUrl, appId, appSecret, rc4Key, cardName, purchaseUrl, jumpText, jumpUrl, useVmp, dexHashes) {
   const dir = path.join(root, ...packageName.split("."));
   fs.mkdirSync(dir, { recursive: true });
   const pkg = `package ${packageName};`;
+  const stringKey = (crypto.randomBytes(1)[0] || 91) & 255;
+  const vmKey = (crypto.randomBytes(1)[0] || 167) & 255;
+  const encoded = (value, key = stringKey) => {
+    const bytes = Buffer.from(String(value), "utf8");
+    for (let i = 0; i < bytes.length; i++) bytes[i] ^= key;
+    return bytes.toString("base64");
+  };
+  const configString = (name, value) => useVmp
+    ? `  static final String ${name} = VmpRuntime.s("${encoded(value)}", ${stringKey});`
+    : `  static final String ${name} = "${javaString(value)}";`;
+  const vmProgram = encoded(Buffer.from([17, 18, 33, 19, 33, 127]).toString("latin1"), vmKey);
+  const dexNames = (dexHashes || []).map((item) => `"${javaString(item.name)}"`).join(",");
+  const dexValues = (dexHashes || []).map((item) => `"${item.sha256}"`).join(",");
   fs.writeFileSync(path.join(dir, "LicenseResult.java"), `${pkg}
 final class LicenseResult {
   final boolean ok; final int code; final String message; final long expiresAt; final long remainingSeconds; final long nextHeartbeatSeconds;
@@ -276,14 +552,14 @@ final class LicenseResult {
   fs.writeFileSync(path.join(dir, "LicenseConfig.java"), `${pkg}
 import android.content.Context; import android.content.SharedPreferences; import java.util.*;
 final class LicenseConfig {
-  static final String DEFAULT_BASE_URL = "${javaString(serverUrl)}";
-  static final String APP_ID = "${javaString(appId)}";
-  static final String APP_SECRET = "${javaString(appSecret)}";
-  static final String RC4_KEY = "${javaString(rc4Key)}";
-  static final String CARD_NAME = "${javaString(cardName)}";
-  static final String PURCHASE_URL = "${javaString(purchaseUrl)}";
-  static final String JUMP_TEXT = "${javaString(jumpText)}";
-  static final String JUMP_URL = "${javaString(jumpUrl)}";
+${configString("DEFAULT_BASE_URL", serverUrl)}
+${configString("APP_ID", appId)}
+${configString("APP_SECRET", appSecret)}
+${configString("RC4_KEY", rc4Key)}
+${configString("CARD_NAME", cardName)}
+${configString("PURCHASE_URL", purchaseUrl)}
+${configString("JUMP_TEXT", jumpText)}
+${configString("JUMP_URL", jumpUrl)}
   static final String APP_VERSION = "1.0";
   private static final String PREFS = "license_config"; private static final String KEY_BASE_URL = "base_url";
   static String getBaseUrl(Context c){ return normalize(c.getSharedPreferences(PREFS,0).getString(KEY_BASE_URL, DEFAULT_BASE_URL)); }
@@ -293,14 +569,49 @@ final class LicenseConfig {
   private static String normalize(String v){ String u = v == null ? "" : v.trim(); if(u.length()==0) u = DEFAULT_BASE_URL; if(!u.startsWith("http://") && !u.startsWith("https://")) u = "https://" + u; while(u.endsWith("/")) u = u.substring(0,u.length()-1); return u; }
 }
 `, "utf8");
+  if (useVmp) {
+    fs.writeFileSync(path.join(dir, "VmpRuntime.java"), `${pkg}
+import android.content.*; import android.os.Debug; import android.util.Base64; import java.io.*; import java.security.*; import java.util.*; import java.util.zip.*;
+final class VmpRuntime {
+  private static final String VM = "${vmProgram}"; private static final int VM_KEY = ${vmKey};
+  private static final String[] DEX_NAMES = new String[]{${dexNames}};
+  private static final String[] DEX_HASHES = new String[]{${dexValues}};
+  private static volatile int integrityState;
+  static String s(String value, int key){ return new String(bytes(value,key), java.nio.charset.StandardCharsets.UTF_8); }
+  private static byte[] bytes(String value,int key){ byte[] data=Base64.decode(value,Base64.DEFAULT); for(int i=0;i<data.length;i++)data[i]=(byte)(data[i]^key); return data; }
+  static boolean check(Context context){
+    if(Debug.isDebuggerConnected()||Debug.waitingForDebugger()||traced())return false;
+    if(integrityState==0){ synchronized(VmpRuntime.class){ if(integrityState==0)integrityState=verifyDex(context)?1:-1; } }
+    return integrityState==1;
+  }
+  private static boolean traced(){ try{ BufferedReader r=new BufferedReader(new FileReader("/proc/self/status")); String line; while((line=r.readLine())!=null){ if(line.startsWith("TracerPid:")){ r.close(); return Integer.parseInt(line.substring(10).trim())!=0; } } r.close(); }catch(Exception ignored){} return false; }
+  private static boolean verifyDex(Context context){
+    if(DEX_NAMES.length==0)return true;
+    try{ ZipFile zip=new ZipFile(context.getApplicationInfo().sourceDir); for(int i=0;i<DEX_NAMES.length;i++){ ZipEntry e=zip.getEntry(DEX_NAMES[i]); if(e==null){zip.close();return false;} InputStream in=zip.getInputStream(e); String actual=sha256(in); in.close(); if(!DEX_HASHES[i].equalsIgnoreCase(actual)){zip.close();return false;} } zip.close(); return true; }catch(Exception e){return false;}
+  }
+  private static String sha256(InputStream in)throws Exception{ MessageDigest md=MessageDigest.getInstance("SHA-256"); byte[] buf=new byte[8192]; int n; while((n=in.read(buf))>0)md.update(buf,0,n); StringBuilder out=new StringBuilder(); for(byte b:md.digest())out.append(String.format(Locale.US,"%02x",b&255)); return out.toString(); }
+  static boolean accept(boolean ok,int code,long expiresAt){
+    byte[] program=bytes(VM,VM_KEY); long[] stack=new long[8]; int sp=0;
+    for(int pc=0;pc<program.length;pc++){ switch(program[pc]&255){
+      case 17: stack[sp++]=ok?1:0; break;
+      case 18: stack[sp++]=code==0?1:0; break;
+      case 19: stack[sp++]=(expiresAt<=0||expiresAt>System.currentTimeMillis()/1000L)?1:0; break;
+      case 33: if(sp<2)return false; stack[sp-2]=(stack[sp-2]!=0&&stack[sp-1]!=0)?1:0; sp--; break;
+      case 127: return sp==1&&stack[0]!=0;
+      default: return false;
+    }} return false;
+  }
+}
+`, "utf8");
+  }
   fs.writeFileSync(path.join(dir, "LicenseClient.java"), `${pkg}
 import android.content.*; import org.json.*; import java.io.*; import java.net.*; import java.nio.charset.*; import java.security.*; import java.util.*;
 final class LicenseClient {
   private final Context context; LicenseClient(Context c){ context = c.getApplicationContext(); }
   LicenseResult activate(String cardKey, String deviceId, String appVersion) throws Exception { JSONObject p = new JSONObject().put("cardKey",cardKey).put("cardName",LicenseConfig.CARD_NAME).put("deviceId",deviceId).put("appVersion",appVersion); return request("/api/activate", p); }
   LicenseResult heartbeat(String cardKey, String deviceId, String appVersion) throws Exception { JSONObject p = new JSONObject().put("cardKey",cardKey).put("cardName",LicenseConfig.CARD_NAME).put("deviceId",deviceId).put("appVersion",appVersion); return request("/api/heartbeat", p); }
-  private LicenseResult request(String path, JSONObject payload) throws Exception { JSONObject env = makeEnvelope(payload); Exception last = null; for(String base: LicenseConfig.getBaseUrls(context)){ try { return once(base, path, env); } catch(Exception e){ last = e; } } throw last == null ? new IllegalStateException("network verify failed") : last; }
-  private LicenseResult once(String base, String path, JSONObject env) throws Exception { HttpURLConnection c=(HttpURLConnection)new URL(base+path).openConnection(); c.setRequestMethod("POST"); c.setConnectTimeout(20000); c.setReadTimeout(20000); c.setDoOutput(true); c.setRequestProperty("Content-Type","application/json; charset=utf-8"); OutputStream o=c.getOutputStream(); o.write(env.toString().getBytes(StandardCharsets.UTF_8)); o.close(); InputStream in=c.getResponseCode()>=400?c.getErrorStream():c.getInputStream(); JSONObject data = open(new JSONObject(readAll(in))); return new LicenseResult(data.optBoolean("ok",false), data.optInt("code",-1), data.optString("message",""), data.optLong("expiresAt",0), data.optLong("remainingSeconds",0), data.optLong("nextHeartbeatSeconds",180)); }
+  private LicenseResult request(String path, JSONObject payload) throws Exception { ${useVmp ? 'if(!VmpRuntime.check(context))throw new SecurityException("runtime integrity check failed"); ' : ''}JSONObject env = makeEnvelope(payload); Exception last = null; for(String base: LicenseConfig.getBaseUrls(context)){ try { return once(base, path, env); } catch(Exception e){ last = e; } } throw last == null ? new IllegalStateException("network verify failed") : last; }
+  private LicenseResult once(String base, String path, JSONObject env) throws Exception { HttpURLConnection c=(HttpURLConnection)new URL(base+path).openConnection(); c.setRequestMethod("POST"); c.setConnectTimeout(20000); c.setReadTimeout(20000); c.setDoOutput(true); c.setRequestProperty("Content-Type","application/json; charset=utf-8"); OutputStream o=c.getOutputStream(); o.write(env.toString().getBytes(StandardCharsets.UTF_8)); o.close(); InputStream in=c.getResponseCode()>=400?c.getErrorStream():c.getInputStream(); JSONObject data = open(new JSONObject(readAll(in))); boolean ok=data.optBoolean("ok",false); int code=data.optInt("code",-1); long expiresAt=data.optLong("expiresAt",0); ${useVmp ? 'ok=VmpRuntime.accept(ok,code,expiresAt); ' : ''}return new LicenseResult(ok, code, data.optString("message",""), expiresAt, data.optLong("remainingSeconds",0), data.optLong("nextHeartbeatSeconds",180)); }
   private JSONObject makeEnvelope(JSONObject p) throws Exception { long ts=System.currentTimeMillis()/1000L; String nonce=UUID.randomUUID().toString().replace("-",""); p.put("ts",ts); String data=hex(rc4(p.toString().getBytes(StandardCharsets.UTF_8), LicenseConfig.RC4_KEY)); String sign=md5(LicenseConfig.APP_ID+ts+nonce+data+LicenseConfig.APP_SECRET); return new JSONObject().put("appId",LicenseConfig.APP_ID).put("ts",ts).put("nonce",nonce).put("data",data).put("sign",sign); }
   private JSONObject open(JSONObject e) throws Exception { String appId=e.optString("appId"), nonce=e.optString("nonce"), data=e.optString("data"), sign=e.optString("sign"); long ts=e.optLong("ts"); if(!LicenseConfig.APP_ID.equals(appId)) throw new IllegalStateException("app id mismatch"); if(Math.abs(System.currentTimeMillis()/1000L-ts)>300) throw new IllegalStateException("server timestamp invalid"); if(!md5(appId+ts+nonce+data+LicenseConfig.APP_SECRET).equalsIgnoreCase(sign)) throw new IllegalStateException("response signature invalid"); JSONObject p=new JSONObject(new String(rc4(fromHex(data), LicenseConfig.RC4_KEY), StandardCharsets.UTF_8)); if(p.optLong("ts")!=ts) throw new IllegalStateException("response timestamp mismatch"); return p; }
   private static String readAll(InputStream in) throws Exception { BufferedReader r=new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8)); StringBuilder b=new StringBuilder(); String l; while((l=r.readLine())!=null)b.append(l); r.close(); return b.toString(); }
@@ -314,7 +625,7 @@ final class LicenseClient {
 import android.app.*; import android.os.*; import android.content.*; import android.graphics.Color; import android.graphics.drawable.*; import android.provider.Settings; import android.view.*; import android.widget.*;
 public class LicenseActivity extends Activity {
   EditText cardInput; TextView statusText; Button button; boolean loading=false;
-  public void onCreate(Bundle b){ super.onCreate(b); requestWindowFeature(Window.FEATURE_NO_TITLE); getWindow().setBackgroundDrawable(new ColorDrawable(Color.rgb(3,14,24))); if(Build.VERSION.SDK_INT>=21){ getWindow().setStatusBarColor(Color.rgb(14,18,35)); getWindow().setNavigationBarColor(Color.rgb(3,14,24)); } getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE); buildUi(); cardInput.setText(getPreferences(0).getString("card","")); button.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){ activate(); }}); if(cardInput.getText().toString().trim().length()>0) heartbeat(); }
+  public void onCreate(Bundle b){ super.onCreate(b); ${useVmp ? 'if(!VmpRuntime.check(this)){ finish(); return; } ' : ''}requestWindowFeature(Window.FEATURE_NO_TITLE); getWindow().setBackgroundDrawable(new ColorDrawable(Color.rgb(3,14,24))); if(Build.VERSION.SDK_INT>=21){ getWindow().setStatusBarColor(Color.rgb(14,18,35)); getWindow().setNavigationBarColor(Color.rgb(3,14,24)); } getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE); buildUi(); cardInput.setText(getPreferences(0).getString("card","")); button.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){ activate(); }}); if(cardInput.getText().toString().trim().length()>0) heartbeat(); }
   void buildUi(){ FrameLayout screen=new FrameLayout(this); GradientDrawable bg=new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,new int[]{Color.rgb(14,18,35),Color.rgb(3,14,24)}); screen.setBackground(bg); LinearLayout root=new LinearLayout(this); root.setGravity(Gravity.CENTER); root.setOrientation(LinearLayout.VERTICAL); root.setPadding(dp(22),0,dp(22),0); LinearLayout box=new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(dp(22),dp(22),dp(22),dp(22)); GradientDrawable panel=new GradientDrawable(); panel.setColor(Color.rgb(22,29,47)); panel.setStroke(dp(1),Color.rgb(49,68,90)); panel.setCornerRadius(dp(10)); box.setBackground(panel); TextView title=t("卡密验证",26,Color.rgb(243,255,249),true); cardInput=input("XXXX-XXXX-XXXX-XXXX",18); button=new Button(this); button.setText("验证并进入"); button.setTextColor(Color.rgb(6,18,15)); button.setTextSize(17); button.setAllCaps(false); GradientDrawable bb=new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,new int[]{Color.rgb(81,231,197),Color.rgb(255,238,97)}); bb.setCornerRadius(dp(10)); button.setBackground(bb); statusText=t("",14,Color.rgb(215,255,245),false); statusText.setVisibility(View.GONE); box.addView(title); add(box,cardInput,24,58); add(box,button,18,60); add(box,statusText,16,-2); int w=getResources().getDisplayMetrics().widthPixels - dp(44); if(w>dp(520)) w=dp(520); if(w<dp(260)) w=dp(260); root.addView(box,new LinearLayout.LayoutParams(w,-2)); screen.addView(root,new FrameLayout.LayoutParams(-1,-1)); addLinks(screen); setContentView(screen,new ViewGroup.LayoutParams(-1,-1)); }
   TextView t(String s,int sp,int c,boolean bold){ TextView v=new TextView(this); v.setText(s); v.setTextSize(sp); v.setTextColor(c); if(bold)v.setTypeface(null,1); return v; }
   EditText input(String h,int sp){ EditText e=new EditText(this); e.setHint(h); e.setSingleLine(true); e.setTextColor(Color.WHITE); e.setHintTextColor(Color.rgb(120,144,156)); e.setTextSize(sp); e.setPadding(dp(14),0,dp(14),0); GradientDrawable d=new GradientDrawable(); d.setColor(Color.rgb(27,40,60)); d.setStroke(dp(1),Color.rgb(48,72,99)); d.setCornerRadius(dp(10)); e.setBackground(d); return e; }
@@ -353,15 +664,27 @@ async function zipList(apk) {
   return out.split(/\r?\n/).filter(Boolean);
 }
 
+async function originalDexHashes(apk, jobDir) {
+  const names = (await zipList(apk)).filter((name) => /^classes(?:\d+)?\.dex$/.test(name));
+  const extractDir = path.join(jobDir, "vmp-original-dex");
+  fs.rmSync(extractDir, { recursive: true, force: true });
+  fs.mkdirSync(extractDir, { recursive: true });
+  const result = [];
+  try {
+    for (const name of names) {
+      await run(jarCommand(), ["xf", apk, name], extractDir);
+      const file = path.join(extractDir, name);
+      result.push({ name, sha256: crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex") });
+    }
+    return result;
+  } finally {
+    fs.rmSync(extractDir, { recursive: true, force: true });
+  }
+}
+
 function jarCommand() {
   const javaHome = process.env.JAVA_HOME || (fs.existsSync("D:\\android\\jbr") ? "D:\\android\\jbr" : "");
   return firstExisting([path.join(javaHome, "bin", "jar.exe"), path.join(javaHome, "bin", "jar"), "jar"]) || "jar";
-}
-
-function findVmpPacker() {
-  const local = path.join(ROOT, "tools", "vmp", "packer.bat");
-  const shell = path.join(ROOT, "tools", "vmp", "packer.sh");
-  return process.env.VMP_PACKER || (fs.existsSync(local) ? local : "") || (fs.existsSync(shell) ? shell : "");
 }
 
 function newestDir(parent) {
@@ -458,7 +781,7 @@ function file(res, filePath) {
 function corsHeaders() {
   return {
     "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET,POST,OPTIONS",
+    "access-control-allow-methods": "GET,POST,PATCH,DELETE,OPTIONS",
     "access-control-allow-headers": "*",
     "access-control-allow-private-network": "true"
   };
