@@ -24,6 +24,10 @@ const LICENSE_DEFAULTS = {
   TIMESTAMP_WINDOW_SECONDS: Number(process.env.TIMESTAMP_WINDOW_SECONDS || 300),
   HEARTBEAT_GRACE_SECONDS: Number(process.env.HEARTBEAT_GRACE_SECONDS || 180)
 };
+const JOBS = new Map();
+const JOB_QUEUE = [];
+const JOB_TTL_MS = 6 * 60 * 60 * 1000;
+let jobRunnerActive = false;
 
 for (const dir of [TOOLS, WORK, OUT, DATA]) fs.mkdirSync(dir, { recursive: true });
 if (!fs.existsSync(CARDS_FILE)) fs.writeFileSync(CARDS_FILE, "[]", "utf8");
@@ -39,6 +43,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/health") return json(res, { ok: true, service: "apk-license-packer" });
     if (req.method === "GET" && url.pathname.startsWith("/out/")) return file(res, path.join(OUT, decodeURIComponent(url.pathname.slice(5))));
     if (req.method === "GET" && url.pathname === "/api/status") return json(res, { ok: true, tools: await detectTools(), accessUrls: accessUrls() });
+    if (req.method === "GET" && url.pathname.startsWith("/api/jobs/")) return jobStatus(res, decodeURIComponent(url.pathname.slice("/api/jobs/".length)));
     if (req.method === "POST" && url.pathname === "/api/process") return await processUpload(req, res, url);
     if (req.method === "GET" && url.pathname === "/admin/cards") return adminJson(req, res, () => ({ ok: true, cards: listCards() }));
     if (req.method === "POST" && url.pathname === "/admin/cards") return adminJson(req, res, async () => createCards(await readJsonBody(req)));
@@ -55,6 +60,14 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`APK drag dashboard listening on 0.0.0.0:${PORT}`);
 });
+
+const jobCleanupTimer = setInterval(() => {
+  const cutoff = Date.now() - JOB_TTL_MS;
+  for (const [id, job] of JOBS) {
+    if (job.updatedAt < cutoff && (job.status === "done" || job.status === "failed")) JOBS.delete(id);
+  }
+}, 60 * 1000);
+jobCleanupTimer.unref?.();
 
 async function processUpload(req, res, url) {
   const originalName = safeName(url.searchParams.get("fileName") || "input.apk");
@@ -79,12 +92,96 @@ async function processUpload(req, res, url) {
   const inputApk = path.join(jobDir, originalName);
   await saveBody(req, inputApk);
 
+  const now = Date.now();
+  const job = {
+    id,
+    status: "queued",
+    progress: "APK 已上传，正在等待云端处理",
+    createdAt: now,
+    updatedAt: now,
+    config: { originalName, serverUrl, appId, appSecret, rc4Key, cardName, purchaseUrl, jumpText, jumpUrl, obfuscate, useVmp },
+    paths: { jobDir, decodedDir, javaDir, classesDir, dexDir, inputApk }
+  };
+  JOBS.set(id, job);
+  JOB_QUEUE.push(job);
+  void runJobQueue();
+
+  return json(res, {
+    ok: true,
+    queued: true,
+    jobId: id,
+    status: job.status,
+    progress: job.progress,
+    statusUrl: `/api/jobs/${encodeURIComponent(id)}`
+  }, 202);
+}
+
+function jobStatus(res, id) {
+  const job = JOBS.get(id);
+  if (!job) return json(res, { ok: false, message: "任务不存在或已过期" }, 404);
+  return json(res, publicJob(job));
+}
+
+function publicJob(job) {
+  const payload = {
+    ok: job.status !== "failed",
+    jobId: job.id,
+    status: job.status,
+    progress: job.progress,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt
+  };
+  if (job.status === "done") payload.result = job.result;
+  if (job.status === "failed") payload.message = job.message || "APK 处理失败";
+  return payload;
+}
+
+function updateJob(job, progress) {
+  job.progress = progress;
+  job.updatedAt = Date.now();
+}
+
+async function runJobQueue() {
+  if (jobRunnerActive) return;
+  jobRunnerActive = true;
+  try {
+    while (JOB_QUEUE.length) {
+      const job = JOB_QUEUE.shift();
+      job.status = "processing";
+      job.startedAt = Date.now();
+      updateJob(job, "正在准备 Android 构建工具");
+      try {
+        job.result = await buildApk(job);
+        job.status = "done";
+        job.finishedAt = Date.now();
+        updateJob(job, "处理完成，可以下载 APK");
+      } catch (error) {
+        job.status = "failed";
+        job.finishedAt = Date.now();
+        job.message = error && error.message ? error.message : String(error);
+        updateJob(job, "处理失败");
+        console.error(`APK job ${job.id} failed:`, error);
+      } finally {
+        try { fs.rmSync(job.paths.jobDir, { recursive: true, force: true }); } catch (_) {}
+      }
+    }
+  } finally {
+    jobRunnerActive = false;
+  }
+}
+
+async function buildApk(job) {
+  const { id } = job;
+  const { originalName, serverUrl, appId, appSecret, rc4Key, cardName, purchaseUrl, jumpText, jumpUrl, obfuscate, useVmp } = job.config;
+  const { jobDir, decodedDir, javaDir, classesDir, dexDir, inputApk } = job.paths;
+
   const tools = await detectTools();
   if (!tools.java || !tools.javac || !tools.d8 || !tools.zipalign || !tools.apksigner || !tools.androidJar) {
     throw new Error("缺少 Java 或 Android SDK 工具，请先安装 Android Studio/SDK。");
   }
   const apktool = await ensureApktool();
 
+  updateJob(job, "正在解析原 APK");
   await run(tools.java, ["-jar", apktool, "d", "-f", inputApk, "-o", decodedDir], jobDir);
   const manifestPath = path.join(decodedDir, "AndroidManifest.xml");
   let manifest = fs.readFileSync(manifestPath, "utf8");
@@ -95,17 +192,20 @@ async function processUpload(req, res, url) {
   manifest = addLicenseActivity(manifest);
   fs.writeFileSync(manifestPath, manifest, "utf8");
 
+  updateJob(job, "正在重建原 APK 并计算完整性校验");
   const unsignedApk = path.join(jobDir, "unsigned.apk");
   await run(tools.java, ["-jar", apktool, "b", decodedDir, "-o", unsignedApk], jobDir);
   const dexHashes = useVmp ? await originalDexHashes(unsignedApk, jobDir) : [];
 
   writeJavaSources(javaDir, packageName, launcher, serverUrl, appId, appSecret, rc4Key, cardName, purchaseUrl, jumpText, jumpUrl, useVmp, dexHashes);
+  updateJob(job, "正在编译验证窗口、心跳和安全传输模块");
   fs.mkdirSync(classesDir, { recursive: true });
   const javaFiles = listFiles(javaDir).filter((f) => f.endsWith(".java"));
   await run(tools.javac, ["-encoding", "UTF-8", "-source", "8", "-target", "8", "-bootclasspath", tools.androidJar, "-d", classesDir, ...javaFiles], jobDir);
   fs.mkdirSync(dexDir, { recursive: true });
   let obfuscationMessage = "验证模块未混淆";
   if (obfuscate && tools.r8 && tools.jar) {
+    updateJob(job, "正在执行 R8 混淆和 VMP+ 保护");
     const classesJar = path.join(jobDir, "license-classes.jar");
     const rules = path.join(jobDir, "r8-rules.pro");
     fs.writeFileSync(rules, [
@@ -126,9 +226,10 @@ async function processUpload(req, res, url) {
   await addDex(withDexApk, path.join(dexDir, "classes.dex"));
 
   const alignedApk = path.join(jobDir, "aligned.apk");
+  updateJob(job, "正在对齐并重新签名 APK");
   await run(tools.zipalign, ["-f", "-p", "4", withDexApk, alignedApk], jobDir);
   const keystore = await ensureKeystore(tools);
-  const signedName = originalName.replace(/\.apk$/i, "") + (useVmp ? "-license-vmp-plus.apk" : "-license.apk");
+  const signedName = originalName.replace(/\.apk$/i, "") + `-${id.slice(-6)}` + (useVmp ? "-license-vmp-plus.apk" : "-license.apk");
   const signedApk = path.join(OUT, signedName);
   await run(tools.apksigner, [
     "sign",
@@ -145,7 +246,7 @@ async function processUpload(req, res, url) {
     ? `已启用内置 VMP+：配置字符串加密、验证结果虚拟机、反调试、${dexHashes.length} 个原始 DEX 完整性校验`
     : "未启用 VMP+ 保护";
 
-  return json(res, {
+  return {
     ok: true,
     file: `/out/${encodeURIComponent(finalName)}`,
     fileName: finalName,
@@ -158,7 +259,7 @@ async function processUpload(req, res, url) {
     jumpUrl,
     obfuscationMessage,
     vmpMessage
-  });
+  };
 }
 
 function loadCards() {
@@ -800,7 +901,8 @@ let selected=null; const drop=document.getElementById('drop'), file=document.get
 drop.onclick=()=>file.click(); file.onchange=()=>setFile(file.files[0]); drop.ondragover=e=>{e.preventDefault();drop.classList.add('drag')}; drop.ondragleave=()=>drop.classList.remove('drag'); drop.ondrop=e=>{e.preventDefault();drop.classList.remove('drag');setFile(e.dataTransfer.files[0])};
 function setFile(f){ if(!f||!f.name.toLowerCase().endsWith('.apk')) return log('璇烽€夋嫨 APK 鏂囦欢'); selected=f; start.disabled=false; log('宸查€夋嫨锛?+f.name+'\\n鐐瑰嚮寮€濮嬪鐞?); }
 function log(t){ statusBox.textContent=t; }
-start.onclick=async()=>{ if(!selected)return; start.disabled=true; dl.innerHTML=''; log('姝ｅ湪鏈満澶勭悊 APK...\\n姝ｅ湪鍔犲叆楠岃瘉绐楀彛鍜屽畨鍏ㄦ牎楠岋紝璇风◢绛夈€?); const qs=new URLSearchParams({fileName:selected.name,serverUrl:server.value,purchaseUrl:purchaseUrl.value,appId:appId.value,appSecret:secret.value,rc4Key:rc4.value,obfuscate:obfuscate.checked?'1':'0',vmp:vmp.checked?'1':'0'}); try{ const r=await fetch('/api/process?'+qs,{method:'POST',body:selected}); const b=await r.json(); if(!b.ok)throw new Error(b.message); log('澶勭悊瀹屾垚\\n鍖呭悕锛?+b.packageName+'\\n鍘熷惎鍔ㄩ〉锛?+b.launcher+'\\n缁熶竴鍚庡彴锛?+b.serverUrl+'\\n瀹夊叏浼犺緭锛氬績璺?+ MD5 + RC4 + 鏃堕棿鎴砛\n'+b.obfuscationMessage+'\\n'+b.vmpMessage); dl.innerHTML='<a href="'+b.file+'">涓嬭浇 '+b.fileName+'</a>'; }catch(e){ log('澶勭悊澶辫触锛歕\n'+e.message); } finally{ start.disabled=false; } };
+async function waitJob(id){ for(let i=0;i<600;i++){ await new Promise(resolve=>setTimeout(resolve,2000)); const r=await fetch('/api/jobs/'+encodeURIComponent(id),{cache:'no-store'}); const j=await r.json(); if(!r.ok)throw new Error(j.message||'读取任务失败'); log((j.progress||'云端正在处理 APK')+'\\n\\n任务号：'+id); if(j.status==='done'&&j.result)return j.result; if(j.status==='failed')throw new Error(j.message||'APK 处理失败'); } throw new Error('APK 处理超过 20 分钟'); }
+start.onclick=async()=>{ if(!selected)return; start.disabled=true; dl.innerHTML=''; log('正在上传 APK...'); const qs=new URLSearchParams({fileName:selected.name,serverUrl:server.value,purchaseUrl:purchaseUrl.value,appId:appId.value,appSecret:secret.value,rc4Key:rc4.value,obfuscate:obfuscate.checked?'1':'0',vmp:vmp.checked?'1':'0'}); try{ const r=await fetch('/api/process?'+qs,{method:'POST',body:selected}); const first=await r.json(); if(!r.ok||!first.ok)throw new Error(first.message||'提交失败'); const b=first.queued?await waitJob(first.jobId):first; log('处理完成\\n包名：'+b.packageName+'\\n原启动页：'+b.launcher+'\\n统一后台：'+b.serverUrl+'\\n安全传输：心跳 + MD5 + RC4 + 时间戳\\n'+b.obfuscationMessage+'\\n'+b.vmpMessage); dl.innerHTML='<a href="'+b.file+'">下载 '+b.fileName+'</a>'; }catch(e){ log('处理失败：\\n'+e.message); } finally{ start.disabled=false; } };
 fetch('/api/status').then(r=>r.json()).then(b=>{ if(!b.ok)return; console.log(b.tools); const phone=(b.accessUrls||[]).filter(x=>!x.includes('127.0.0.1')); access.textContent=phone.length?'瀹夊崜鎵嬫満涓庣數鑴戣繛鎺ュ悓涓€ Wi-Fi 鍚庢墦寮€锛?+phone.join(' 鎴?'):'鐢佃剳璁块棶锛歨ttp://127.0.0.1:${PORT}'; });
 </script></body></html>`;
 }
