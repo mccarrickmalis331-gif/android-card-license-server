@@ -23,7 +23,8 @@ WORKDIR /app
 COPY package.json ./
 COPY server.js ./
 
-RUN mkdir -p tools work out
+RUN mkdir -p tools work out \
+  && wget -q https://github.com/iBotPeaches/Apktool/releases/download/v3.0.2/apktool_3.0.2.jar -O tools/apktool_3.0.2.jar
 
 EXPOSE 7860
 CMD ["node", "server.js"]
