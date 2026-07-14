@@ -240,7 +240,8 @@ async function buildApk(job) {
       signature: { keystore, alias: "androiddebugkey", storepass: "android", keypass: "android" }
     }, null, 2), "utf8");
     const excludedAbis = await dptExcludedAbis(withDexApk);
-    const dptArgs = ["-Xmx384m", "-jar", tools.dpt, "-f", withDexApk, "-o", signedApk, "-c", dptConfig, "-vs"];
+    // DPT configures a minimum of two worker threads and fails when a host reports one CPU.
+    const dptArgs = ["-Xmx384m", "-XX:ActiveProcessorCount=2", "-jar", tools.dpt, "-f", withDexApk, "-o", signedApk, "-c", dptConfig, "-vs"];
     if (excludedAbis.length) dptArgs.push("-e", excludedAbis.join(","));
     await run(tools.java, dptArgs, path.dirname(tools.dpt));
   } else {
