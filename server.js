@@ -80,7 +80,8 @@ async function processUpload(req, res, url) {
   const jumpText = normalizeOptionalText(url.searchParams.get("jumpText") || "");
   const jumpUrl = normalizeOptionalUrl(url.searchParams.get("jumpUrl") || "");
   const obfuscate = url.searchParams.get("obfuscate") !== "0";
-  const useVmp = url.searchParams.get("vmp") === "1";
+  const fullVmp = url.searchParams.get("fullVmp") === "1" || url.searchParams.get("wholeApp") === "1";
+  const useVmp = fullVmp || url.searchParams.get("vmp") === "1";
   const id = new Date().toISOString().replace(/[-:.TZ]/g, "") + "-" + crypto.randomBytes(3).toString("hex");
   const jobDir = path.join(WORK, id);
   const decodedDir = path.join(jobDir, "decoded");
@@ -99,7 +100,7 @@ async function processUpload(req, res, url) {
     progress: "APK 已上传，正在等待云端处理",
     createdAt: now,
     updatedAt: now,
-    config: { originalName, serverUrl, appId, appSecret, rc4Key, cardName, purchaseUrl, jumpText, jumpUrl, obfuscate, useVmp },
+    config: { originalName, serverUrl, appId, appSecret, rc4Key, cardName, purchaseUrl, jumpText, jumpUrl, obfuscate, useVmp, fullVmp },
     paths: { jobDir, decodedDir, javaDir, classesDir, dexDir, inputApk }
   };
   JOBS.set(id, job);
@@ -172,7 +173,7 @@ async function runJobQueue() {
 
 async function buildApk(job) {
   const { id } = job;
-  const { originalName, serverUrl, appId, appSecret, rc4Key, cardName, purchaseUrl, jumpText, jumpUrl, obfuscate, useVmp } = job.config;
+  const { originalName, serverUrl, appId, appSecret, rc4Key, cardName, purchaseUrl, jumpText, jumpUrl, obfuscate, useVmp, fullVmp } = job.config;
   const { jobDir, decodedDir, javaDir, classesDir, dexDir, inputApk } = job.paths;
 
   const tools = await detectTools();
@@ -190,12 +191,13 @@ async function buildApk(job) {
   manifest = removeLauncherFilters(manifest);
   manifest = addInternetPermission(manifest);
   manifest = addLicenseActivity(manifest);
+  if (fullVmp) manifest = hardenManifest(manifest);
   fs.writeFileSync(manifestPath, manifest, "utf8");
 
   updateJob(job, "正在重建原 APK 并计算完整性校验");
   const unsignedApk = path.join(jobDir, "unsigned.apk");
   await run(tools.java, ["-jar", apktool, "b", decodedDir, "-o", unsignedApk], jobDir);
-  const dexHashes = useVmp ? await originalDexHashes(unsignedApk, jobDir) : [];
+  const dexHashes = useVmp && !fullVmp ? await originalDexHashes(unsignedApk, jobDir) : [];
 
   writeJavaSources(javaDir, packageName, launcher, serverUrl, appId, appSecret, rc4Key, cardName, purchaseUrl, jumpText, jumpUrl, useVmp, dexHashes);
   updateJob(job, "正在编译验证窗口、心跳和安全传输模块");
@@ -225,24 +227,45 @@ async function buildApk(job) {
   fs.copyFileSync(unsignedApk, withDexApk);
   await addDex(withDexApk, path.join(dexDir, "classes.dex"));
 
-  const alignedApk = path.join(jobDir, "aligned.apk");
-  updateJob(job, "正在对齐并重新签名 APK");
-  await run(tools.zipalign, ["-f", "-p", "4", withDexApk, alignedApk], jobDir);
-  const keystore = await ensureKeystore(tools);
-  const signedName = originalName.replace(/\.apk$/i, "") + `-${id.slice(-6)}` + (useVmp ? "-license-vmp-plus.apk" : "-license.apk");
+  const signedName = originalName.replace(/\.apk$/i, "") + `-${id.slice(-6)}` + (fullVmp ? "-license-full-vmp.apk" : useVmp ? "-license-vmp-plus.apk" : "-license.apk");
   const signedApk = path.join(OUT, signedName);
-  await run(tools.apksigner, [
-    "sign",
-    "--ks", keystore,
-    "--ks-pass", "pass:android",
-    "--key-pass", "pass:android",
-    "--ks-key-alias", "androiddebugkey",
-    "--out", signedApk,
-    alignedApk
-  ], jobDir);
+  const keystore = await ensureKeystore(tools);
+
+  if (fullVmp) {
+    if (!tools.dpt) throw new Error("整包 VMP 引擎未安装，请重新部署最新 Docker 镜像。");
+    updateJob(job, "正在执行整包函数抽取、壳随机化和签名自校验");
+    const dptConfig = path.join(jobDir, "dpt-protect-config.json");
+    fs.writeFileSync(dptConfig, JSON.stringify({
+      shellPkgName: "<random>",
+      signature: { keystore, alias: "androiddebugkey", storepass: "android", keypass: "android" }
+    }, null, 2), "utf8");
+    const excludedAbis = await dptExcludedAbis(withDexApk);
+    const dptArgs = ["-Xmx384m", "-jar", tools.dpt, "-f", withDexApk, "-o", signedApk, "-c", dptConfig, "-vs"];
+    if (excludedAbis.length) dptArgs.push("-e", excludedAbis.join(","));
+    await run(tools.java, dptArgs, path.dirname(tools.dpt));
+  } else {
+    const alignedApk = path.join(jobDir, "aligned.apk");
+    updateJob(job, "正在对齐并重新签名 APK");
+    await run(tools.zipalign, ["-f", "-p", "4", withDexApk, alignedApk], jobDir);
+    await run(tools.apksigner, [
+      "sign",
+      "--ks", keystore,
+      "--ks-pass", "pass:android",
+      "--key-pass", "pass:android",
+      "--ks-key-alias", "androiddebugkey",
+      "--out", signedApk,
+      alignedApk
+    ], jobDir);
+  }
+
+  updateJob(job, "正在校验 APK 对齐和签名");
+  await run(tools.zipalign, ["-c", "-v", "4", signedApk], jobDir);
+  await run(tools.apksigner, ["verify", "--verbose", signedApk], jobDir);
 
   const finalName = signedName;
-  const vmpMessage = useVmp
+  const vmpMessage = fullVmp
+    ? "已启用整包 VMP 兼容模式：全部应用 DEX 函数代码抽取、运行时回填、随机壳包、原生壳段加密、垃圾类、签名证书自校验"
+    : useVmp
     ? `已启用内置 VMP+：配置字符串加密、验证结果虚拟机、反调试、${dexHashes.length} 个原始 DEX 完整性校验`
     : "未启用 VMP+ 保护";
 
@@ -258,7 +281,8 @@ async function buildApk(job) {
     jumpText,
     jumpUrl,
     obfuscationMessage,
-    vmpMessage
+    vmpMessage,
+    fullVmp
   };
 }
 
@@ -496,6 +520,7 @@ async function readJsonBody(req) {
 async function detectTools() {
   const sdk = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT || path.join(os.homedir(), "AppData", "Local", "Android", "Sdk");
   const javaHome = process.env.JAVA_HOME || (fs.existsSync("D:\\android\\jbr") ? "D:\\android\\jbr" : "");
+  const dptHome = process.env.DPT_HOME || path.join(TOOLS, "dpt");
   const buildTools = newestDir(path.join(sdk, "build-tools"));
   const platform = newestDir(path.join(sdk, "platforms"));
   return {
@@ -510,7 +535,9 @@ async function detectTools() {
     apksigner: firstExisting([path.join(buildTools || "", "apksigner.bat"), path.join(buildTools || "", "apksigner")]),
     androidJar: platform ? path.join(platform, "android.jar") : "",
     apktool: fs.existsSync(path.join(TOOLS, `apktool_${APKTOOL_VERSION}.jar`)) ? path.join(TOOLS, `apktool_${APKTOOL_VERSION}.jar`) : "",
-    vmp: "builtin-vmp-plus"
+    vmp: "builtin-vmp-plus",
+    dpt: firstExisting([path.join(dptHome, "dpt.jar")]),
+    fullVmp: fs.existsSync(path.join(dptHome, "dpt.jar")) ? "whole-dex-function-extraction" : ""
   };
 }
 
@@ -581,6 +608,12 @@ function addLicenseActivity(manifest) {
         </activity>
 `;
   return manifest.replace(/<\/application>/, `${activity}    </application>`);
+}
+
+function hardenManifest(manifest) {
+  return manifest
+    .replace(/\sandroid:debuggable="(?:true|false)"/g, "")
+    .replace(/\sandroid:testOnly="(?:true|false)"/g, "");
 }
 
 function normalizeActivityName(name, packageName) {
@@ -781,6 +814,23 @@ async function originalDexHashes(apk, jobDir) {
   } finally {
     fs.rmSync(extractDir, { recursive: true, force: true });
   }
+}
+
+async function dptExcludedAbis(apk) {
+  const entries = await zipList(apk);
+  const abiMap = {
+    "armeabi-v7a": "arm",
+    "arm64-v8a": "arm64",
+    "x86": "x86",
+    "x86_64": "x86_64"
+  };
+  const present = new Set();
+  for (const name of entries) {
+    const match = name.match(/^lib\/([^/]+)\/[^/]+\.so$/);
+    if (match && abiMap[match[1]]) present.add(abiMap[match[1]]);
+  }
+  if (!present.size) return [];
+  return ["arm", "arm64", "x86", "x86_64"].filter((abi) => !present.has(abi));
 }
 
 function jarCommand() {
